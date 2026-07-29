@@ -371,10 +371,11 @@ async def _handle_screenshot(msg: dict[str, Any], ts: int) -> None:
         or msg.get("base64")
         or (data.get("image") if data else None)
         or (data.get("base64") if data else None)
+        or (data.get("image_base64") if data else None)
         or msg.get("data")  # data 可能直接是 base64 字符串
     )
     if isinstance(b64, dict):
-        b64 = b64.get("image") or b64.get("base64")
+        b64 = b64.get("image") or b64.get("base64") or b64.get("image_base64")
     if not b64 or not isinstance(b64, str):
         logger.warning("screenshot 消息缺少 base64 数据")
         return

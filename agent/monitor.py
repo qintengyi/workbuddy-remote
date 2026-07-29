@@ -16,6 +16,7 @@ import io
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -66,6 +67,10 @@ class SharedState:
     memory_mb: float = 0.0
     agent_started_at: float = field(default_factory=time.time)
     last_screenshot_at: Optional[int] = None
+    # 最近会话列表（最多 20 条），供 status 上报
+    conversations: list[dict[str, Any]] = field(default_factory=list)
+    # 自动化列表，供 status 上报
+    automations: list[dict[str, Any]] = field(default_factory=list)
 
     def uptime_seconds(self) -> int:
         return int(time.time() - self.agent_started_at)
@@ -81,6 +86,7 @@ class SharedState:
             "uptime_seconds": self.uptime_seconds(),
             "active_conversation_id": self.active_conversation_id,
             "active_conversation_title": self.active_conversation_title,
+            "screenshot_updated_at": self.last_screenshot_at,
         }
 
 
@@ -231,13 +237,27 @@ class SystemMonitor:
 
 
 class DBMonitor:
-    """只读轮询 workbuddy.db，diff 后上报。"""
+    """只读轮询 workbuddy.db，diff 后上报。
+
+    活动会话 hook（三源合一）：
+    - 主源：sessions.json 的 sessions 数组（当前打开会话列表，最实时）
+    - 验证：扫描进程列表找 `--serve --session-id <id>`，确认会话进程在运行
+    - 补充：从 workbuddy.db sessions 表查该 id 的 title/status/cwd
+
+    同时上报：
+    - 最近 20 条会话（status.conversations + event conversations_sync）
+    - 所有自动化（status.automations + event automations_sync）
+    """
+
+    # 匹配 cmdline 里的 --session-id <UUID>
+    _SESSION_ID_RE = re.compile(r"--session-id\s+([0-9a-fA-F-]{36})")
 
     def __init__(
         self,
         state: SharedState,
         db_path: Path,
         interval: float = 5.0,
+        data_dir: Optional[Path] = None,
     ) -> None:
         self.state = state
         self.db_path = Path(db_path)
@@ -249,6 +269,16 @@ class DBMonitor:
         self._run_keys: set[str] = set()
         self._session_fingerprint: dict[str, tuple] = {}
         self._initialized = False
+        # sessions.json 路径：<data_dir>/app/sessions.json
+        if data_dir is not None:
+            self.data_dir = Path(data_dir)
+        else:
+            # 默认从 db_path 推断（db_path = data_dir/workbuddy.db）
+            self.data_dir = self.db_path.parent
+        self.sessions_json_path = self.data_dir / "app" / "sessions.json"
+        # sync 事件节流（30s 一次）
+        self._last_conversations_sync: int = 0
+        self._last_automations_sync: int = 0
 
     def _connect_ro(self) -> sqlite3.Connection:
         # mode=ro 避免锁；immutable 不用，避免看不到 WAL 新写入
@@ -267,19 +297,27 @@ class DBMonitor:
         events: list[dict[str, Any]] = []
         if not self.db_path.is_file():
             logger.debug("DB 不存在: %s", self.db_path)
+            # 即使没有 db，也尝试读 sessions.json 获取活动会话
+            self._poll_active_session(None)
+            self._initialized = True
             return events
 
         try:
             conn = self._connect_ro()
         except sqlite3.Error as e:
             logger.warning("打开 workbuddy.db 失败: %s", e)
+            self._poll_active_session(None)
+            self._initialized = True
             return events
 
         try:
             events.extend(self._poll_automations(conn))
             events.extend(self._poll_runtime(conn))
             events.extend(self._poll_runs(conn))
-            self._poll_sessions(conn)
+            # 活动会话 hook：sessions.json + 进程扫描 + db 验证
+            self._poll_active_session(conn)
+            # 最近会话列表 + 自动化列表（写入 state 供 status 上报）
+            self._poll_recent_conversations(conn)
         except sqlite3.Error as e:
             logger.warning("轮询 DB 出错: %s", e)
         finally:
@@ -288,16 +326,38 @@ class DBMonitor:
             except Exception:
                 pass
 
+        # 节流发送 sync 事件（30s 一次）
+        now = _now_ts()
+        if now - self._last_conversations_sync >= 30:
+            self._last_conversations_sync = now
+            events.append(
+                {
+                    "type": "conversations_sync",
+                    "data": {"items": self.state.conversations},
+                }
+            )
+        if now - self._last_automations_sync >= 30:
+            self._last_automations_sync = now
+            events.append(
+                {
+                    "type": "automations_sync",
+                    "data": {"items": self.state.automations},
+                }
+            )
+
         self._initialized = True
         return events
 
     def _poll_automations(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
+        # 注意：WorkBuddy 的 automations 表里所有行都有 deleted_at（软删除时间戳），
+        # 但 status 仍为 ACTIVE/PAUSED。按 team-lead 要求上报所有自动化，不过滤 deleted_at。
         rows = conn.execute(
-            "SELECT id, name, status, last_run_at, next_run_at, updated_at "
-            "FROM automations WHERE deleted_at IS NULL"
+            "SELECT id, name, status, last_run_at, next_run_at, updated_at, deleted_at "
+            "FROM automations"
         ).fetchall()
         current: dict[str, str] = {}
+        auto_list: list[dict[str, Any]] = []
         for r in rows:
             aid = r["id"]
             status = r["status"] or ""
@@ -318,7 +378,18 @@ class DBMonitor:
                     }
                 )
                 logger.info("自动化状态变化: %s %s -> %s", name, old, status)
+            # 构建 status 上报用的 automations 列表（毫秒转秒）
+            auto_list.append(
+                {
+                    "id": aid,
+                    "name": name,
+                    "status": status,
+                    "last_run_at": _ms_to_sec(r["last_run_at"]),
+                    "next_run_at": _ms_to_sec(r["next_run_at"]),
+                }
+            )
         self._auto_status = current
+        self.state.automations = auto_list
         return events
 
     def _poll_runtime(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -400,38 +471,168 @@ class DBMonitor:
             )
         return events
 
-    def _poll_sessions(self, conn: sqlite3.Connection) -> None:
-        """更新 active conversation / last_activity，不直接发 new_message
-        （消息体在 sessions 文件里，此处只刷新状态字段）。
+    def _read_sessions_json(self) -> list[dict[str, Any]]:
+        """读取 sessions.json（当前打开的会话列表，最实时）。
+
+        文件结构：{"version":1,"updatedAt":"...","sessions":[{conversationId,...}]}
         """
         try:
+            with open(self.sessions_json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            sessions = data.get("sessions", [])
+            if not isinstance(sessions, list):
+                return []
+            return sessions
+        except FileNotFoundError:
+            logger.debug("sessions.json 不存在: %s", self.sessions_json_path)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.debug("读 sessions.json 失败: %s", e)
+        return []
+
+    def _scan_active_session_ids(self) -> set[str]:
+        """扫描进程列表，找 cmdline 含 `--serve --session-id <UUID>` 的进程。
+
+        返回当前真正在运行的会话 ID 集合。
+        """
+        ids: set[str] = set()
+        try:
+            for proc in psutil.process_iter(["pid", "cmdline"]):
+                try:
+                    cmdline = proc.info.get("cmdline") or []
+                    if not cmdline:
+                        continue
+                    # 快速过滤
+                    joined = " ".join(cmdline)
+                    if "--serve" not in joined or "--session-id" not in joined:
+                        continue
+                    m = self._SESSION_ID_RE.search(joined)
+                    if m:
+                        ids.add(m.group(1))
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+        except Exception as e:
+            logger.debug("扫描 session 进程失败: %s", e)
+        return ids
+
+    def _poll_active_session(self, conn: Optional[sqlite3.Connection]) -> None:
+        """活动会话 hook（三源合一）。
+
+        - 主源：sessions.json 第一个会话（按 resumedAt 最新排序后取第一个）
+        - 验证：进程扫描结果 active_ids，若主源会话在其中则确认，否则回退
+        - 补充：从 db sessions 表查 title/status/cwd/last_activity_at
+        """
+        sessions_json_list = self._read_sessions_json()
+        active_ids = self._scan_active_session_ids()
+
+        # 按 resumedAt DESC 排序 sessions.json
+        def resumed_key(s: dict) -> str:
+            return s.get("resumedAt") or s.get("startedAt") or ""
+
+        sorted_sessions = sorted(
+            sessions_json_list, key=resumed_key, reverse=True
+        )
+
+        # 选活动会话：优先 sessions.json 中第一个且进程在运行的
+        active_id: Optional[str] = None
+        for s in sorted_sessions:
+            cid = s.get("conversationId")
+            if cid and cid in active_ids:
+                active_id = cid
+                break
+
+        # 回退1：sessions.json 第一个（即使进程没扫到，可能扫描权限不足）
+        if not active_id and sorted_sessions:
+            active_id = sorted_sessions[0].get("conversationId")
+
+        # 回退2：sessions.json 空，但有进程在运行
+        if not active_id and active_ids:
+            active_id = next(iter(active_ids))
+
+        if not active_id:
+            # 没有活动会话
+            if self._initialized and self.state.active_conversation_id is not None:
+                logger.info("无活动会话（sessions.json 与进程扫描均为空）")
+            self.state.active_conversation_id = None
+            self.state.active_conversation_title = None
+            return
+
+        # 从 db 补充 title/status/cwd/last_activity_at
+        if conn is None:
+            return
+        try:
             row = conn.execute(
-                "SELECT id, title, custom_title, status, last_activity_at, updated_at "
-                "FROM sessions WHERE deleted_at IS NULL "
-                "ORDER BY COALESCE(last_activity_at, updated_at) DESC LIMIT 1"
+                "SELECT id, title, custom_title, status, cwd, "
+                "last_activity_at, updated_at "
+                "FROM sessions WHERE id = ?",
+                (active_id,),
             ).fetchone()
         except sqlite3.Error as e:
-            logger.debug("读 sessions 失败: %s", e)
+            logger.debug("查活动会话 %s 失败: %s", active_id, e)
             return
+
         if not row:
+            # db 里没有该会话（可能已删除或未同步），仅设 id
+            self.state.active_conversation_id = active_id
+            self.state.active_conversation_title = ""
             return
-        sid = row["id"]
+
         title = row["custom_title"] or row["title"] or ""
-        if len(title) > 80:
-            title = title[:77] + "..."
+        if len(title) > 60:
+            title = title[:60]
         activity = _ms_to_sec(row["last_activity_at"] or row["updated_at"])
-        self.state.active_conversation_id = sid
+
+        prev_id = self.state.active_conversation_id
+        self.state.active_conversation_id = row["id"]
         self.state.active_conversation_title = title
         if activity:
-            # 取较大值
-            if not self.state.last_activity_at or activity > self.state.last_activity_at:
+            # 取较大值，避免回退
+            if (
+                not self.state.last_activity_at
+                or activity > self.state.last_activity_at
+            ):
                 self.state.last_activity_at = activity
 
-        fp = (row["status"], row["updated_at"], row["last_activity_at"])
-        old = self._session_fingerprint.get(sid)
-        self._session_fingerprint[sid] = fp
-        if self._initialized and old is not None and old != fp:
-            logger.debug("会话活动更新: %s %s", sid, title)
+        if self._initialized and prev_id != row["id"]:
+            logger.info(
+                "活动会话切换: %s -> %s (%s)",
+                prev_id,
+                row["id"],
+                title,
+            )
+
+    def _poll_recent_conversations(
+        self, conn: sqlite3.Connection, limit: int = 20
+    ) -> None:
+        """读最近 20 条会话（deleted_at IS NULL），写入 state.conversations。"""
+        try:
+            rows = conn.execute(
+                "SELECT id, title, custom_title, status, cwd, "
+                "last_activity_at, updated_at "
+                "FROM sessions WHERE deleted_at IS NULL "
+                "ORDER BY COALESCE(last_activity_at, updated_at) DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        except sqlite3.Error as e:
+            logger.debug("读最近会话失败: %s", e)
+            return
+
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            title = row["custom_title"] or row["title"] or ""
+            if len(title) > 60:
+                title = title[:60]
+            items.append(
+                {
+                    "id": row["id"],
+                    "title": title,
+                    "last_activity_at": _ms_to_sec(
+                        row["last_activity_at"] or row["updated_at"]
+                    ),
+                    "status": row["status"],
+                    "cwd": row["cwd"],
+                }
+            )
+        self.state.conversations = items
 
     async def run(self, emit: Callable[[dict], Any]) -> None:
         logger.info("DBMonitor 启动，间隔 %.1fs，db=%s", self.interval, self.db_path)
@@ -660,32 +861,69 @@ class FileMonitor:
 # ─────────────────────────────────────────────────────────────
 
 
-def find_workbuddy_hwnd() -> Optional[int]:
-    """查找 WorkBuddy 主窗口句柄（模糊匹配标题）。"""
+def find_workbuddy_hwnd(preferred_pid: Optional[int] = None) -> Optional[int]:
+    """查找 WorkBuddy 主窗口句柄。
+
+    策略：
+    1) 用 psutil 找 WorkBuddy 主进程 PID（preferred_pid 优先）
+    2) EnumWindows 找该 PID 下的可见窗口，选最大那个
+    3) 回退：标题模糊匹配 "workbuddy"
+    4) 再回退：pywinauto
+    """
     try:
         import win32gui
     except ImportError:
         logger.debug("pywin32 不可用，尝试 pywinauto 找窗口")
         return _find_hwnd_pywinauto()
 
-    result: list[int] = []
+    # 收集候选 PID（WorkBuddy 主进程及子进程）
+    workbuddy_pids: set[int] = set()
+    if preferred_pid:
+        workbuddy_pids.add(int(preferred_pid))
+    try:
+        for proc in psutil.process_iter(["pid", "name", "exe"]):
+            try:
+                info = proc.info
+                name = (info.get("name") or "").lower()
+                exe = (info.get("exe") or "").lower()
+                if "workbuddy" in name or "workbuddy" in exe:
+                    workbuddy_pids.add(int(info["pid"]))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception as e:
+        logger.debug("收集 workbuddy PID 失败: %s", e)
+
+    # EnumWindows，按 PID 或标题匹配
+    by_pid: list[tuple[int, int, int]] = []  # (hwnd, width*height)
+    by_title: list[tuple[int, int, int]] = []
 
     def enum_cb(hwnd, _):  # noqa: ANN001
         if not win32gui.IsWindowVisible(hwnd):
             return
         try:
-            title = win32gui.GetWindowText(hwnd) or ""
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
         except Exception:
             return
-        if "workbuddy" in title.lower():
-            # 排除尺寸过小的子窗
+        w = right - left
+        h = bottom - top
+        if w < 200 or h < 200:
+            return
+        area = w * h
+        # 标题匹配
+        try:
+            title = (win32gui.GetWindowText(hwnd) or "").lower()
+        except Exception:
+            title = ""
+        if "workbuddy" in title:
+            by_title.append((hwnd, area, 0))
+        # PID 匹配
+        if workbuddy_pids:
             try:
-                left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-                if (right - left) < 200 or (bottom - top) < 200:
-                    return
+                _, pid = win32gui.GetWindowThreadProcessId(hwnd)
+                if int(pid) in workbuddy_pids:
+                    by_pid.append((hwnd, area, int(pid)))
             except Exception:
                 return
-            result.append(hwnd)
 
     try:
         win32gui.EnumWindows(enum_cb, None)
@@ -693,7 +931,16 @@ def find_workbuddy_hwnd() -> Optional[int]:
         logger.debug("EnumWindows 失败: %s", e)
         return _find_hwnd_pywinauto()
 
-    return result[0] if result else None
+    # 优先 PID 匹配的最大窗口
+    if by_pid:
+        by_pid.sort(key=lambda x: x[1], reverse=True)
+        return by_pid[0][0]
+    # 其次标题匹配
+    if by_title:
+        by_title.sort(key=lambda x: x[1], reverse=True)
+        return by_title[0][0]
+    # 最后 pywinauto
+    return _find_hwnd_pywinauto()
 
 
 def _find_hwnd_pywinauto() -> Optional[int]:
@@ -701,88 +948,55 @@ def _find_hwnd_pywinauto() -> Optional[int]:
         from pywinauto import Desktop
 
         desk = Desktop(backend="uia")
+        candidates: list[tuple[int, int]] = []
         for w in desk.windows():
             try:
                 title = w.window_text() or ""
                 if "workbuddy" in title.lower():
-                    return int(w.handle)
+                    try:
+                        r = w.rectangle()
+                        area = r.width() * r.height()
+                        if r.width() >= 200 and r.height() >= 200:
+                            candidates.append((int(w.handle), area))
+                    except Exception:
+                        candidates.append((int(w.handle), 0))
             except Exception:
                 continue
+        if candidates:
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            return candidates[0][0]
     except Exception as e:
         logger.debug("pywinauto 找窗失败: %s", e)
     return None
 
 
-def capture_workbuddy_window(
-    max_width: int = 1280,
-    jpeg_quality: int = 70,
-) -> Optional[tuple[str, int]]:
-    """截取 WorkBuddy 窗口，返回 (base64_jpg, taken_at) 或 None。
-
-    只截窗口区域，不截全屏（隐私）。
-    """
-    hwnd = find_workbuddy_hwnd()
-    if not hwnd:
-        logger.debug("未找到 WorkBuddy 窗口，跳过截图")
-        return None
-
+def _grab_fullscreen(max_width: int = 1280, jpeg_quality: int = 70) -> Optional[tuple[str, int, bool]]:
+    """截取整个主屏，返回 (base64_jpg, taken_at, is_fullscreen)。"""
     try:
         from PIL import ImageGrab, Image
     except ImportError:
         logger.error("pillow 未安装，无法截图")
         return None
-
-    # 获取窗口矩形
     try:
-        import win32gui
-        import win32con
-
-        # 还原最小化
         try:
-            if win32gui.IsIconic(hwnd):
-                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                time.sleep(0.15)
-        except Exception:
-            pass
-        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            img = ImageGrab.grab(all_screens=True)
+        except TypeError:
+            img = ImageGrab.grab()
+    except Exception as e:
+        logger.warning("全屏截图失败: %s", e)
+        return None
+    return _encode_screenshot(img, max_width, jpeg_quality, is_fullscreen=True)
+
+
+def _encode_screenshot(
+    img, max_width: int, jpeg_quality: int, is_fullscreen: bool = False
+) -> Optional[tuple[str, int, bool]]:
+    """缩放并编码为 JPEG base64，返回 (b64, taken_at, is_fullscreen)。"""
+    try:
+        from PIL import Image  # noqa: F401
     except ImportError:
-        # 无 pywin32：用 pywinauto
-        try:
-            from pywinauto import Application
-
-            app = Application(backend="uia").connect(handle=hwnd)
-            w = app.window(handle=hwnd)
-            rect = w.rectangle()
-            left, top, right, bottom = rect.left, rect.top, rect.right, rect.bottom
-        except Exception as e:
-            logger.warning("获取窗口矩形失败: %s", e)
-            return None
-    except Exception as e:
-        logger.warning("GetWindowRect 失败: %s", e)
         return None
-
-    width = right - left
-    height = bottom - top
-    if width < 50 or height < 50:
-        logger.debug("窗口尺寸异常: %sx%s", width, height)
-        return None
-
     try:
-        # bbox 是屏幕坐标
-        img = ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True)
-    except TypeError:
-        # 老版本 pillow 无 all_screens
-        try:
-            img = ImageGrab.grab(bbox=(left, top, right, bottom))
-        except Exception as e:
-            logger.warning("截图失败: %s", e)
-            return None
-    except Exception as e:
-        logger.warning("截图失败: %s", e)
-        return None
-
-    try:
-        # 缩放到不超过 max_width
         if img.width > max_width:
             ratio = max_width / float(img.width)
             new_size = (max_width, max(1, int(img.height * ratio)))
@@ -797,13 +1011,90 @@ def capture_workbuddy_window(
         img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
         b64 = base64.b64encode(buf.getvalue()).decode("ascii")
         taken = _now_ts()
+        kind = "全屏" if is_fullscreen else "窗口"
         logger.debug(
-            "截图成功: %dx%d -> %d bytes b64", img.width, img.height, len(b64)
+            "截图成功(%s): %dx%d -> %d bytes b64",
+            kind,
+            img.width,
+            img.height,
+            len(b64),
         )
-        return b64, taken
+        return b64, taken, is_fullscreen
     except Exception as e:
         logger.warning("编码截图失败: %s", e)
         return None
+
+
+def capture_workbuddy_window(
+    max_width: int = 1280,
+    jpeg_quality: int = 70,
+    preferred_pid: Optional[int] = None,
+) -> Optional[tuple[str, int, bool]]:
+    """截取 WorkBuddy 窗口，返回 (base64_jpg, taken_at, is_fullscreen) 或 None。
+
+    失败回退全屏截图，绝不抛异常。
+    """
+    try:
+        from PIL import ImageGrab
+    except ImportError:
+        logger.error("pillow 未安装，无法截图")
+        return None
+
+    hwnd = find_workbuddy_hwnd(preferred_pid=preferred_pid)
+    if not hwnd:
+        logger.debug("未找到 WorkBuddy 窗口，回退全屏截图")
+        return _grab_fullscreen(max_width, jpeg_quality)
+
+    # 获取窗口矩形
+    left = top = right = bottom = 0
+    got_rect = False
+    try:
+        import win32gui
+        import win32con
+
+        # 还原最小化
+        try:
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                time.sleep(0.15)
+        except Exception:
+            pass
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        got_rect = True
+    except ImportError:
+        try:
+            from pywinauto import Application
+
+            app = Application(backend="uia").connect(handle=hwnd)
+            w = app.window(handle=hwnd)
+            rect = w.rectangle()
+            left, top, right, bottom = rect.left, rect.top, rect.right, rect.bottom
+            got_rect = True
+        except Exception as e:
+            logger.warning("获取窗口矩形失败: %s", e)
+    except Exception as e:
+        logger.warning("GetWindowRect 失败: %s", e)
+
+    if not got_rect:
+        return _grab_fullscreen(max_width, jpeg_quality)
+
+    width = right - left
+    height = bottom - top
+    # 窗口最小化或矩形异常：回退全屏
+    if width < 50 or height < 50 or left < -10000 or top < -10000:
+        logger.debug("窗口矩形异常 %dx%d，回退全屏截图", width, height)
+        return _grab_fullscreen(max_width, jpeg_quality)
+
+    try:
+        try:
+            img = ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True)
+        except TypeError:
+            img = ImageGrab.grab(bbox=(left, top, right, bottom))
+    except Exception as e:
+        logger.warning("窗口截图失败: %s，回退全屏", e)
+        return _grab_fullscreen(max_width, jpeg_quality)
+
+    return _encode_screenshot(img, max_width, jpeg_quality, is_fullscreen=False)
 
 
 class ScreenshotMonitor:
@@ -823,16 +1114,20 @@ class ScreenshotMonitor:
     async def capture_and_emit(
         self, emit: Callable[[dict], Any]
     ) -> Optional[dict[str, Any]]:
-        result = await asyncio.to_thread(capture_workbuddy_window)
+        result = await asyncio.to_thread(
+            capture_workbuddy_window,
+            preferred_pid=self.state.workbuddy_pid,
+        )
         if not result:
             return None
-        b64, taken = result
+        b64, taken, is_fullscreen = result
         self.state.last_screenshot_at = taken
         msg = {
             "type": "screenshot",
             "data": {
                 "taken_at": taken,
                 "image_base64": b64,
+                "is_fullscreen": is_fullscreen,
             },
         }
         await _maybe_await(emit(msg))
@@ -887,7 +1182,8 @@ class MonitorHub:
             self.state, interval=cfg.system_poll_interval
         )
         self.db = DBMonitor(
-            self.state, cfg.db_path, interval=cfg.db_poll_interval
+            self.state, cfg.db_path, interval=cfg.db_poll_interval,
+            data_dir=Path(cfg.workbuddy_data_dir),
         )
         watch_dirs = [cfg.teams_dir, cfg.tasks_dir, cfg.memory_dir]
         # 额外监听工作区 memory（若存在）

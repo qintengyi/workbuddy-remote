@@ -26,7 +26,7 @@ async def ws_app_handler(request: web.Request) -> web.WebSocketResponse:
     if not payload:
         raise web.HTTPUnauthorized(text="invalid token")
 
-    ws = web.WebSocketResponse(heartbeat=30)
+    ws = web.WebSocketResponse()
     await ws.prepare(request)
     broker.register_app(ws)
     logger.info("iOS WS 连接: user=%s", payload.get("username"))
@@ -131,25 +131,27 @@ async def ws_agent_handler(request: web.Request) -> web.WebSocketResponse:
     if not auth.verify_agent_token(token):
         raise web.HTTPUnauthorized(text="invalid agent token")
 
-    ws = web.WebSocketResponse(heartbeat=30, max_msg_size=16 * 1024 * 1024)
+    ws = web.WebSocketResponse(max_msg_size=16 * 1024 * 1024)
     await ws.prepare(request)
     await broker.register_agent(ws)
     logger.info("Agent WS 连接已建立")
 
     try:
         async for msg in ws:
+            logger.debug("Agent WS recv msg.type=%s", msg.type)
             if msg.type == WSMsgType.TEXT:
                 await _handle_agent_text(msg.data)
             elif msg.type == WSMsgType.BINARY:
-                # 不期望二进制，忽略
                 logger.debug("Agent 发来 binary %d bytes，忽略", len(msg.data))
             elif msg.type == WSMsgType.ERROR:
                 logger.warning("Agent WS 错误: %s", ws.exception())
                 break
             elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED):
+                logger.info("Agent WS 收到关闭帧 type=%s", msg.type)
                 break
+        logger.info("Agent WS async for 退出（正常结束）")
     except Exception as e:
-        logger.warning("Agent WS 异常: %s", e)
+        logger.warning("Agent WS 异常: %s (type=%s)", e, type(e).__name__)
     finally:
         await broker.unregister_agent(ws)
         if not ws.closed:

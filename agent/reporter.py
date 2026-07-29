@@ -184,7 +184,6 @@ class Reporter:
         assert self._session is not None
         async with self._session.ws_connect(
             url,
-            heartbeat=30,
             autoclose=True,
             autoping=True,
             max_msg_size=16 * 1024 * 1024,
