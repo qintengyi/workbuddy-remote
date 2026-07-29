@@ -92,7 +92,7 @@ struct LoginView: View {
                         Text("服务器地址")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        TextField("http://192.168.1.8:10372", text: $vm.serverURL)
+                        TextField("http://192.168.1.8", text: $vm.serverURL)
                             .textFieldStyle(.roundedBorder)
                             .keyboardType(.URL)
                             .textInputAutocapitalization(.never)
@@ -155,9 +155,12 @@ struct LoginView: View {
                         Label("默认账号 admin / qty8520123", systemImage: "info.circle")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        Label("服务器地址填局域网 IP 或反代域名", systemImage: "network")
+                        Label("地址填 http://192.168.1.8（不要带 :10372）", systemImage: "network")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                        Label("10372 被防火墙拦截，已用 80 端口反代", systemImage: "exclamationmark.shield")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
                     }
                     .padding(.horizontal, 8)
 

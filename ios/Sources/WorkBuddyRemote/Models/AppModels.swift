@@ -5,7 +5,8 @@ import Foundation
 /// 本地配置（持久化到 UserDefaults）
 /// 仅保存服务器地址 + 登录 token + 用户名
 struct AppSettings: Codable, Equatable {
-    /// 服务器地址，如 http://192.168.1.8:10372 或 https://workbuddy.example.com
+    /// 服务器地址，如 http://192.168.1.8 或 https://workbuddy.example.com
+    /// 注意：当前服务器 10372 被防火墙白名单拦截，请走 nginx 反代的 80/443
     var serverURL: String
     /// 登录 token
     var token: String?
@@ -13,7 +14,7 @@ struct AppSettings: Codable, Equatable {
     var username: String?
 
     static let `default` = AppSettings(
-        serverURL: "http://192.168.1.8:10372",
+        serverURL: "http://192.168.1.8",
         token: nil,
         username: nil
     )

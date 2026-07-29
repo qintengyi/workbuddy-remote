@@ -77,7 +77,7 @@ async def list_conversations(request: web.Request) -> web.Response:
     except ValueError:
         return _err(400, "invalid limit/offset")
     items = storage.list_conversations(limit=limit, offset=offset)
-    return _ok({"items": items, "limit": limit, "offset": offset})
+    return _ok(items)
 
 
 async def list_messages(request: web.Request) -> web.Response:
@@ -96,7 +96,7 @@ async def list_messages(request: web.Request) -> web.Response:
         except ValueError:
             return _err(400, "invalid before")
     items = storage.list_messages(conv_id, limit=limit, before=before)
-    return _ok({"items": items, "conversation_id": conv_id})
+    return _ok(items)
 
 
 async def post_message(request: web.Request) -> web.Response:
@@ -134,7 +134,7 @@ async def post_message(request: web.Request) -> web.Response:
 
 async def list_automations(request: web.Request) -> web.Response:
     items = storage.list_automations()
-    return _ok({"items": items})
+    return _ok(items)
 
 
 async def pause_automation(request: web.Request) -> web.Response:
@@ -185,7 +185,7 @@ async def list_automation_runs(request: web.Request) -> web.Response:
     except ValueError:
         return _err(400, "invalid limit")
     items = storage.list_automation_runs(auto_id, limit=limit)
-    return _ok({"items": items, "automation_id": auto_id})
+    return _ok(items)
 
 
 # ─── tasks ───
@@ -194,7 +194,7 @@ async def list_automation_runs(request: web.Request) -> web.Response:
 async def list_tasks(request: web.Request) -> web.Response:
     team = request.rel_url.query.get("team") or None
     items = storage.list_tasks(team=team)
-    return _ok({"items": items, "team": team})
+    return _ok(items)
 
 
 # ─── screenshot ───
@@ -204,7 +204,7 @@ async def get_screenshot(request: web.Request) -> web.Response:
     row = storage.get_agent_status_row()
     taken_at = row.get("screenshot_updated_at")
     if not SCREENSHOT_PATH.exists():
-        return _err(404, "screenshot not available", {"url": None, "taken_at": taken_at})
+        return _ok({"url": None, "taken_at": taken_at})
     return _ok(
         {
             "url": "/files/screenshot_latest.jpg",
@@ -229,7 +229,7 @@ async def list_events(request: web.Request) -> web.Response:
         except ValueError:
             return _err(400, "invalid since")
     items = storage.list_events(limit=limit, since=since)
-    return _ok({"items": items})
+    return _ok(items)
 
 
 # ─── 注册路由 ───

@@ -5,6 +5,7 @@ import Foundation
 enum APIError: LocalizedError {
     case invalidURL
     case invalidResponse
+    case networkError(String)
     case httpError(Int)
     case decodeError(String)
     case businessError(code: Int, message: String?)
@@ -18,6 +19,8 @@ enum APIError: LocalizedError {
             return "服务器地址无效，请在设置中检查服务器地址。"
         case .invalidResponse:
             return "服务器响应格式异常。"
+        case .networkError(let msg):
+            return msg
         case .httpError(let code):
             return "网络请求失败（HTTP \(code)）。"
         case .decodeError(let msg):
@@ -130,7 +133,7 @@ final class WorkBuddyAPI {
         do {
             (rawData, response) = try await session.data(for: req)
         } catch {
-            throw APIError.invalidResponse
+            throw Self.mapNetworkError(error)
         }
 
         if let http = response as? HTTPURLResponse {
@@ -151,8 +154,29 @@ final class WorkBuddyAPI {
         } catch let err as APIError {
             throw err
         } catch {
-            throw APIError.decodeError(error.localizedDescription)
+            let bodyPreview = String(data: rawData, encoding: .utf8) ?? "<non-utf8 \(rawData.count) bytes>"
+            throw APIError.decodeError("\(error.localizedDescription) | body=\(bodyPreview.prefix(200))")
         }
+    }
+
+    /// 把 URLSession 网络错误转成可读的中文提示（不要伪装成“响应格式异常”）
+    private static func mapNetworkError(_ error: Error) -> APIError {
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain {
+            switch ns.code {
+            case NSURLErrorTimedOut:
+                return .networkError("连接超时。请确认服务器地址是否正确；若填了 :10372 请改成 http://192.168.1.8（走 80 端口反代）。")
+            case NSURLErrorCannotConnectToHost, NSURLErrorNetworkConnectionLost:
+                return .networkError("无法连接服务器。端口可能被防火墙拦截，请使用 http://192.168.1.8（不要带 :10372）。")
+            case NSURLErrorNotConnectedToInternet:
+                return .networkError("当前网络不可用，请检查手机 Wi‑Fi。")
+            case NSURLErrorCannotFindHost:
+                return .networkError("找不到服务器主机，请检查地址拼写。")
+            default:
+                break
+            }
+        }
+        return .networkError("网络请求失败：\(error.localizedDescription)")
     }
 
     // MARK: - 认证
@@ -161,14 +185,25 @@ final class WorkBuddyAPI {
     /// - Parameters:
     ///   - username: 用户名
     ///   - password: 明文密码
-    ///   - serverURL: 服务器地址（如 http://192.168.1.8:10372）
+    ///   - serverURL: 服务器地址（如 http://192.168.1.8）
     /// - Returns: 登录 token
     func login(username: String, password: String, serverURL: String) async throws -> String {
         let trimmed = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, var components = URLComponents(string: trimmed) else {
             throw APIError.invalidURL
         }
-        var basePath = components.path ?? ""
+        // 无 scheme 时补 http://，避免 "192.168.1.8" 被 URLComponents 解析失败
+        if components.scheme == nil {
+            guard var fixed = URLComponents(string: "http://\(trimmed)") else {
+                throw APIError.invalidURL
+            }
+            components = fixed
+        }
+        // 10372 在当前服务器被防火墙白名单拦截，强制提醒改 80
+        if components.port == 10372 {
+            // 不硬改用户输入，但给出更清晰失败路径：仍尝试；超时走 networkError 文案
+        }
+        var basePath = components.path
         if basePath.hasSuffix("/") { basePath.removeLast() }
         components.path = basePath + "/api/auth/login"
         guard let url = components.url else { throw APIError.invalidURL }
@@ -187,7 +222,7 @@ final class WorkBuddyAPI {
         do {
             (rawData, response) = try await session.data(for: req)
         } catch {
-            throw APIError.invalidResponse
+            throw Self.mapNetworkError(error)
         }
 
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
@@ -197,14 +232,21 @@ final class WorkBuddyAPI {
             throw APIError.httpError(http.statusCode)
         }
 
-        let decoded = try JSONDecoder().decode(APIResponse<LoginData>.self, from: rawData)
-        if !decoded.isSuccess {
-            throw APIError.businessError(code: decoded.code, message: decoded.msg)
+        do {
+            let decoded = try JSONDecoder().decode(APIResponse<LoginData>.self, from: rawData)
+            if !decoded.isSuccess {
+                throw APIError.businessError(code: decoded.code, message: decoded.msg)
+            }
+            guard let token = decoded.data?.token, !token.isEmpty else {
+                throw APIError.decodeError("登录响应中缺少 token")
+            }
+            return token
+        } catch let err as APIError {
+            throw err
+        } catch {
+            let bodyPreview = String(data: rawData, encoding: .utf8) ?? "<non-utf8 \(rawData.count) bytes>"
+            throw APIError.decodeError("\(error.localizedDescription) | body=\(bodyPreview.prefix(200))")
         }
-        guard let token = decoded.data?.token, !token.isEmpty else {
-            throw APIError.decodeError("登录响应中缺少 token")
-        }
-        return token
     }
 
     // MARK: - 状态
