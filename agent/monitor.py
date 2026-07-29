@@ -1225,6 +1225,9 @@ class MonitorHub:
         self.screenshot = ScreenshotMonitor(
             self.state, interval=cfg.screenshot_interval
         )
+        # CDP Hook（直接 hook WorkBuddy 渲染进程）
+        from cdp_hook import CDPHook
+        self.cdp = CDPHook()
         self._tasks: list[asyncio.Task] = []
 
     async def _emit(self, msg: dict[str, Any]) -> None:
@@ -1250,8 +1253,77 @@ class MonitorHub:
             asyncio.create_task(self.db.run(self._emit), name="db"),
             asyncio.create_task(self.files.run(self._emit), name="files"),
             asyncio.create_task(self.screenshot.run(self._emit), name="screenshot"),
+            asyncio.create_task(self._cdp_loop(), name="cdp"),
         ]
         logger.info("MonitorHub 已启动 %d 个协程", len(self._tasks))
+
+    async def _cdp_loop(self) -> None:
+        """CDP hook 循环：自动检测 CDP 端口，连接后定期读取消息并上报。"""
+        from cdp_hook import is_cdp_available
+        poll_count = 0
+        while True:
+            try:
+                if not self.cdp.connected:
+                    if await is_cdp_available():
+                        if await self.cdp.connect():
+                            # 连接成功后探索 DOM（一次性诊断）
+                            dom_info = await self.cdp.explore_dom()
+                            if dom_info:
+                                logger.info("CDP DOM 探索: url=%s inputs=%d buttons=%d",
+                                            dom_info.get("url", "")[:60],
+                                            len(dom_info.get("inputs", [])),
+                                            len(dom_info.get("buttons", [])))
+                                # 上报 DOM 探索结果
+                                await self._emit({
+                                    "type": "event",
+                                    "data": {
+                                        "event_type": "cdp_connected",
+                                        "data": {
+                                            "url": dom_info.get("url", ""),
+                                            "title": dom_info.get("title", ""),
+                                            "inputs": len(dom_info.get("inputs", [])),
+                                            "buttons": len(dom_info.get("buttons", [])),
+                                            "react_roots": dom_info.get("reactRoots", []),
+                                        },
+                                    },
+                                })
+                        else:
+                            logger.debug("CDP 可用但连接失败")
+                    # CDP 不可用时每 10 秒检测一次
+                    await asyncio.sleep(10)
+                    continue
+
+                # CDP 已连接，每 5 秒读取一次消息
+                poll_count += 1
+                msg_data = await self.cdp.get_messages()
+                if msg_data and msg_data.get("messages"):
+                    # 有消息数据，上报
+                    await self._emit({
+                        "type": "event",
+                        "data": {
+                            "event_type": "messages_sync",
+                            "data": msg_data,
+                        },
+                    })
+
+                # 每 30 秒探索一次 DOM（用于调试和适配前端变化）
+                if poll_count % 6 == 0:
+                    conv_data = await self.cdp.get_conversations()
+                    if conv_data:
+                        await self._emit({
+                            "type": "event",
+                            "data": {
+                                "event_type": "cdp_exploration",
+                                "data": conv_data,
+                            },
+                        })
+
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug("CDP loop 错误: %s", e)
+                await asyncio.sleep(10)
 
     async def stop(self) -> None:
         self.process.stop()

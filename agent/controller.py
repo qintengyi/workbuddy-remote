@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 import time
@@ -29,12 +30,15 @@ class Controller:
 
     # ─── send_message ───────────────────────────────────────
 
-    def send_message(
+    async def send_message(
         self, content: str, conversation_id: Optional[str] = None
     ) -> dict[str, Any]:
-        """向 WorkBuddy 当前会话输入框发送消息并回车。
+        """向 WorkBuddy 当前会话发送消息。
 
-        conversation_id 目前仅记录，UI 层切换会话依赖用户手动/后续增强。
+        优先级：
+        1. CDP hook（直接执行 JS 操作输入框，最可靠）
+        2. pywinauto UIA（定位窗口控件）
+        3. pyautogui（键盘输入回退）
         """
         if not content:
             return {"ok": False, "error": "empty content"}
@@ -45,11 +49,22 @@ class Controller:
             conversation_id,
         )
 
-        # 1) 优先 pywinauto UIA
+        # 0) 优先 CDP hook
+        if self.hub and hasattr(self.hub, "cdp") and self.hub.cdp.connected:
+            try:
+                result = await self.hub.cdp.send_message(content)
+                if result.get("ok"):
+                    logger.info("CDP 发送成功: %s", result.get("method"))
+                    return {"ok": True, "method": "cdp", **result}
+                logger.warning("CDP 发送失败: %s，回退 pywinauto", result.get("error"))
+            except Exception as e:
+                logger.warning("CDP 发送异常: %s，回退 pywinauto", e)
+
+        # 1) pywinauto UIA
         try:
-            ok, err = self._send_via_pywinauto(content)
+            ok, err = await asyncio.to_thread(self._send_via_pywinauto, content)
             if ok:
-                return {"ok": True}
+                return {"ok": True, "method": "pywinauto"}
             logger.warning("pywinauto 发送失败: %s，尝试 pyautogui", err)
         except Exception as e:
             logger.warning("pywinauto 异常: %s，尝试 pyautogui", e)
@@ -57,7 +72,7 @@ class Controller:
 
         # 2) 回退 pyautogui
         try:
-            ok, err2 = self._send_via_pyautogui(content)
+            ok, err2 = await asyncio.to_thread(self._send_via_pyautogui, content)
             if ok:
                 return {"ok": True}
             return {"ok": False, "error": err2 or err or "send failed"}
@@ -489,7 +504,7 @@ class Controller:
                 conv = msg.get("conversation_id")
                 if conv is None and isinstance(msg.get("data"), dict):
                     conv = msg["data"].get("conversation_id")
-                result = await _to_thread(self.send_message, content, conv)
+                result = await self.send_message(content, conv)
 
             elif cmd == "pause_automation":
                 aid = msg.get("id") or (msg.get("data") or {}).get("id")

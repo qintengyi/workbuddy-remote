@@ -264,6 +264,23 @@ def list_conversations(limit: int = 20, offset: int = 0) -> list[dict[str, Any]]
     return [dict(r) for r in rows]
 
 
+def replace_conversations(items: list) -> None:
+    """全量替换会话列表（agent sync 调用）。"""
+    now = int(time.time())
+    with transaction() as conn:
+        conn.execute("DELETE FROM conversations")
+        for item in items:
+            if isinstance(item, dict) and item.get("id"):
+                conn.execute(
+                    """INSERT INTO conversations (id, title, last_message_at, last_activity_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                         title=excluded.title, last_activity_at=excluded.last_activity_at, updated_at=excluded.updated_at""",
+                    (str(item["id"]), item.get("title") or "", item.get("last_message_at") or now,
+                     item.get("last_activity_at") or now, now),
+                )
+
+
 def insert_message(conversation_id: str, role: str, content: str, ts: Optional[int] = None) -> int:
     if ts is None:
         ts = int(time.time())
@@ -355,6 +372,21 @@ def list_automations() -> list[dict[str, Any]]:
         "SELECT * FROM automations ORDER BY updated_at DESC"
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def replace_automations(items: list) -> None:
+    """全量替换自动化列表（agent sync 调用）。"""
+    now = int(time.time())
+    with transaction() as conn:
+        conn.execute("DELETE FROM automations")
+        for item in items:
+            if isinstance(item, dict) and item.get("id"):
+                conn.execute(
+                    """INSERT INTO automations (id, name, status, last_run_at, next_run_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (str(item["id"]), item.get("name") or "", item.get("status") or "ACTIVE",
+                     item.get("last_run_at"), item.get("next_run_at"), now),
+                )
 
 
 def get_automation(auto_id: str) -> Optional[dict[str, Any]]:

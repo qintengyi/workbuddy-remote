@@ -322,31 +322,16 @@ async def _process_business_event(event_type: str, data: dict[str, Any], ts: int
         await broadcast_to_apps({"type": "log", "data": data, "ts": ts})
         return
 
-    # 自动化列表同步等
+    # 自动化列表同步（全量替换）
     if event_type == "automations_sync":
         items = data.get("items") or data.get("automations") or []
-        for item in items:
-            if isinstance(item, dict) and item.get("id"):
-                storage.upsert_automation(
-                    str(item["id"]),
-                    name=item.get("name") or "",
-                    status=item.get("status") or "ACTIVE",
-                    last_run_at=item.get("last_run_at"),
-                    next_run_at=item.get("next_run_at"),
-                )
+        storage.replace_automations(items)
         await broadcast_to_apps({"type": "automations_sync", "data": data, "ts": ts})
         return
 
     if event_type == "conversations_sync":
         items = data.get("items") or data.get("conversations") or []
-        for item in items:
-            if isinstance(item, dict) and item.get("id"):
-                storage.upsert_conversation(
-                    str(item["id"]),
-                    title=item.get("title") or "",
-                    last_message_at=item.get("last_message_at"),
-                    last_activity_at=item.get("last_activity_at"),
-                )
+        storage.replace_conversations(items)
         return
 
     if event_type == "tasks_sync":
