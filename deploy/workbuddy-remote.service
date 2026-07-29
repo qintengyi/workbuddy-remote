@@ -1,0 +1,20 @@
+[Unit]
+Description=WorkBuddy Remote Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/www/wwwroot/workbuddy-remote/server
+ExecStart=/usr/bin/python3 /www/wwwroot/workbuddy-remote/server/main.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+# 日志走 journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=workbuddy-remote
+
+[Install]
+WantedBy=multi-user.target

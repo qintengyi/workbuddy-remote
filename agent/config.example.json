@@ -1,0 +1,11 @@
+{
+  "server_url": "ws://192.168.1.8:10372",
+  "agent_token": "<首次启动服务端生成，填这里>",
+  "workbuddy_data_dir": "C:/Users/Administrator/.workbuddy",
+  "screenshot_interval": 15,
+  "status_interval": 5,
+  "db_poll_interval": 5,
+  "process_poll_interval": 5,
+  "system_poll_interval": 5,
+  "file_debounce_ms": 500
+}
