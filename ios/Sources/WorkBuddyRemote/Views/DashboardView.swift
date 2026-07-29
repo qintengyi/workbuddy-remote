@@ -393,7 +393,7 @@ struct ScreenshotImageView: View {
                     .gesture(
                         MagnifyGesture()
                             .onChanged { value in
-                                scale = max(1.0, min(5.0, lastScale * value))
+                                scale = max(1.0, min(5.0, lastScale * value.magnification))
                             }
                             .onEnded { value in
                                 lastScale = scale

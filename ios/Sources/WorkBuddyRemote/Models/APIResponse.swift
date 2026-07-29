@@ -55,6 +55,11 @@ struct ScreenshotData: Decodable {
         url = try? c.decodeIfPresent(String.self, forKey: .url)
         takenAt = c.decodeFlexibleInt64(forKey: .takenAt)
     }
+
+    init(url: String? = nil, takenAt: Int64? = nil) {
+        self.url = url
+        self.takenAt = takenAt
+    }
 }
 
 // MARK: - 发送消息响应
@@ -62,6 +67,13 @@ struct ScreenshotData: Decodable {
 struct SendMessageResult: Decodable {
     let ok: Bool?
     let queued: Bool?
+
+    private enum CodingKeys: String, CodingKey { case ok, queued }
+
+    init(ok: Bool? = nil, queued: Bool? = nil) {
+        self.ok = ok
+        self.queued = queued
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
