@@ -65,6 +65,12 @@ class SharedState:
     active_conversation_title: Optional[str] = None
     cpu_percent: float = 0.0
     memory_mb: float = 0.0
+    memory_total_mb: float = 0.0
+    memory_percent: float = 0.0
+    cpu_count: int = 0
+    disk_used_gb: float = 0.0
+    disk_total_gb: float = 0.0
+    disk_percent: float = 0.0
     agent_started_at: float = field(default_factory=time.time)
     last_screenshot_at: Optional[int] = None
     # 最近会话列表（最多 20 条），供 status 上报
@@ -82,7 +88,13 @@ class SharedState:
             "workbuddy_pid": self.workbuddy_pid,
             "last_activity_at": self.last_activity_at,
             "cpu_percent": round(self.cpu_percent, 1),
+            "cpu_count": self.cpu_count,
             "memory_mb": round(self.memory_mb, 1),
+            "memory_total_mb": round(self.memory_total_mb, 1),
+            "memory_percent": round(self.memory_percent, 1),
+            "disk_used_gb": round(self.disk_used_gb, 1),
+            "disk_total_gb": round(self.disk_total_gb, 1),
+            "disk_percent": round(self.disk_percent, 1),
             "uptime_seconds": self.uptime_seconds(),
             "active_conversation_id": self.active_conversation_id,
             "active_conversation_title": self.active_conversation_title,
@@ -189,9 +201,19 @@ class SystemMonitor:
         except Exception:
             self.state.cpu_percent = 0.0
 
-        # 优先取 WorkBuddy 进程内存，否则取系统内存占用（本 agent + 系统概览）
-        mem_mb = 0.0
+        # CPU 核心数
         try:
+            self.state.cpu_count = psutil.cpu_count(logical=True) or 0
+        except Exception:
+            self.state.cpu_count = 0
+
+        # 内存：已使用/总量/百分比
+        try:
+            vm = psutil.virtual_memory()
+            self.state.memory_total_mb = vm.total / (1024 * 1024)
+            self.state.memory_percent = vm.percent
+            # memory_mb 优先取 WorkBuddy 进程内存，否则取系统已用
+            mem_mb = 0.0
             if self.state.workbuddy_pid:
                 try:
                     p = psutil.Process(self.state.workbuddy_pid)
@@ -199,7 +221,6 @@ class SystemMonitor:
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
             if mem_mb <= 0:
-                # 累加所有 workbuddy 相关进程
                 for proc in psutil.process_iter(["pid", "name", "memory_info"]):
                     try:
                         name = (proc.info.get("name") or "").lower()
@@ -210,10 +231,19 @@ class SystemMonitor:
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         continue
             if mem_mb <= 0:
-                mem_mb = psutil.virtual_memory().used / (1024 * 1024)
+                mem_mb = vm.used / (1024 * 1024)
+            self.state.memory_mb = mem_mb
         except Exception as e:
             logger.debug("采样内存失败: %s", e)
-        self.state.memory_mb = mem_mb
+
+        # 磁盘：系统盘已使用/总量/百分比
+        try:
+            du = psutil.disk_usage("/")
+            self.state.disk_used_gb = du.used / (1024 ** 3)
+            self.state.disk_total_gb = du.total / (1024 ** 3)
+            self.state.disk_percent = du.percent
+        except Exception:
+            pass
 
     async def run(self, emit: Callable[[dict], Any]) -> None:
         logger.info("SystemMonitor 启动，间隔 %.1fs", self.interval)
@@ -350,11 +380,10 @@ class DBMonitor:
 
     def _poll_automations(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
-        # 注意：WorkBuddy 的 automations 表里所有行都有 deleted_at（软删除时间戳），
-        # 但 status 仍为 ACTIVE/PAUSED。按 team-lead 要求上报所有自动化，不过滤 deleted_at。
+        # 只上报未软删除的自动化（deleted_at IS NULL）
         rows = conn.execute(
             "SELECT id, name, status, last_run_at, next_run_at, updated_at, deleted_at "
-            "FROM automations"
+            "FROM automations WHERE deleted_at IS NULL"
         ).fetchall()
         current: dict[str, str] = {}
         auto_list: list[dict[str, Any]] = []
@@ -603,12 +632,12 @@ class DBMonitor:
     def _poll_recent_conversations(
         self, conn: sqlite3.Connection, limit: int = 20
     ) -> None:
-        """读最近 20 条会话（deleted_at IS NULL），写入 state.conversations。"""
+        """读最近 20 条会话（deleted_at IS NULL 且 status != 'archived'），写入 state.conversations。"""
         try:
             rows = conn.execute(
                 "SELECT id, title, custom_title, status, cwd, "
                 "last_activity_at, updated_at "
-                "FROM sessions WHERE deleted_at IS NULL "
+                "FROM sessions WHERE deleted_at IS NULL AND status != 'archived' "
                 "ORDER BY COALESCE(last_activity_at, updated_at) DESC LIMIT ?",
                 (limit,),
             ).fetchall()

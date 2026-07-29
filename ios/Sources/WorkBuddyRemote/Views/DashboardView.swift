@@ -213,36 +213,64 @@ struct DashboardView: View {
                     .font(.headline)
                 Spacer()
             }
-            HStack(spacing: 16) {
-                // CPU
-                VStack(alignment: .leading, spacing: 4) {
+            // CPU
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
                     Text("CPU")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    HStack(alignment: .firstTextBaseline, spacing: 2) {
-                        Text(String(format: "%.1f", vm.status.cpuPercent ?? 0))
-                            .font(.title3.monospacedDigit().bold())
-                        Text("%")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    if let cores = vm.status.cpuCount, cores > 0 {
+                        Text("\(cores) 核")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
                     }
+                    Spacer()
+                    Text(String(format: "%.1f%%", vm.status.cpuPercent ?? 0))
+                        .font(.subheadline.monospacedDigit().bold())
+                        .foregroundStyle(.orange)
                 }
-                Divider()
-                    .frame(height: 32)
-                // 内存
-                VStack(alignment: .leading, spacing: 4) {
+                ProgressView(value: vm.status.cpuPercent ?? 0, total: 100)
+                    .tint(.orange)
+            }
+            // 内存
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
                     Text("内存")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    HStack(alignment: .firstTextBaseline, spacing: 2) {
-                        Text("\(vm.status.memoryMb ?? 0)")
-                            .font(.title3.monospacedDigit().bold())
-                        Text("MB")
-                            .font(.caption)
+                    Spacer()
+                    if let total = vm.status.memoryTotalMb, total > 0 {
+                        Text("\(vm.status.memoryMb ?? 0) / \(total) MB")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("\(vm.status.memoryMb ?? 0) MB")
+                            .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
                 }
-                Spacer()
+                if let pct = vm.status.memoryPercent {
+                    ProgressView(value: pct, total: 100)
+                        .tint(.blue)
+                }
+            }
+            // 磁盘
+            if vm.status.diskTotalGb != nil {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("磁盘")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text(String(format: "%.1f / %.0f GB", vm.status.diskUsedGb ?? 0, vm.status.diskTotalGb ?? 0))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    if let pct = vm.status.diskPercent {
+                        ProgressView(value: pct, total: 100)
+                            .tint(.green)
+                    }
+                }
             }
         }
         .cardStyle()

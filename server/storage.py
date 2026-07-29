@@ -134,6 +134,19 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO agent_status (id, updated_at) VALUES (1, ?)",
             (int(time.time()),),
         )
+        # 兼容旧表：补列（ALTER TABLE 忽略已存在的列）
+        for col, typ in [
+            ("cpu_count", "INTEGER"),
+            ("memory_total_mb", "REAL"),
+            ("memory_percent", "REAL"),
+            ("disk_used_gb", "REAL"),
+            ("disk_total_gb", "REAL"),
+            ("disk_percent", "REAL"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE agent_status ADD COLUMN {col} {typ}")
+            except Exception:
+                pass  # 列已存在
         # 清理 30 天前 events
         cutoff = int(time.time()) - 30 * 24 * 3600
         cur = conn.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
@@ -450,7 +463,13 @@ def update_agent_status(data: dict[str, Any]) -> None:
         ("active_conversation_id", "active_conversation_id"),
         ("active_conversation_title", "active_conversation_title"),
         ("cpu_percent", "cpu_percent"),
+        ("cpu_count", "cpu_count"),
         ("memory_mb", "memory_mb"),
+        ("memory_total_mb", "memory_total_mb"),
+        ("memory_percent", "memory_percent"),
+        ("disk_used_gb", "disk_used_gb"),
+        ("disk_total_gb", "disk_total_gb"),
+        ("disk_percent", "disk_percent"),
         ("uptime_seconds", "uptime_seconds"),
         ("screenshot_updated_at", "screenshot_updated_at"),
     ]

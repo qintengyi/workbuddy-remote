@@ -41,7 +41,13 @@ def get_status_payload() -> dict[str, Any]:
         "active_conversation_id": row.get("active_conversation_id"),
         "active_conversation_title": row.get("active_conversation_title"),
         "cpu_percent": row.get("cpu_percent"),
+        "cpu_count": row.get("cpu_count"),
         "memory_mb": row.get("memory_mb"),
+        "memory_total_mb": row.get("memory_total_mb"),
+        "memory_percent": row.get("memory_percent"),
+        "disk_used_gb": row.get("disk_used_gb"),
+        "disk_total_gb": row.get("disk_total_gb"),
+        "disk_percent": row.get("disk_percent"),
         "uptime_seconds": row.get("uptime_seconds"),
         "screenshot_updated_at": row.get("screenshot_updated_at"),
     }
